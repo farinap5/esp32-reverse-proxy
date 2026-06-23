@@ -1,0 +1,20 @@
+#pragma once
+
+#define WIFI_SSID     "wifi"
+#define WIFI_PASSWORD "wifi_password_123"
+
+// ── Relay server ──────────────────────────────────────────────────────
+// Address and port of the Python relay server.
+// The server must be reachable from BOTH your home network (for the ESP
+// to connect out) AND from your work network (for SOCKS5 clients).
+// A cheap VPS or a router with port-forwarding works fine.
+//
+// Start the server with:
+//   python main.py -r <SERVER_PORT> -l <SOCKS5_PORT> -s
+//
+// Example (server on VPS at 203.0.113.42):
+//   python main.py -r 6668 -l 6669 -s
+//   → ESP  connects to 203.0.113.42:6668
+//   → Work browser/tool uses SOCKS5 proxy 203.0.113.42:6669
+#define SERVER_HOST "192.168.16.13"
+#define SERVER_PORT 6668

@@ -3,12 +3,25 @@
 
 import logging
 import queue
+import re
 import select
 import struct
 import threading
 import time
 from socketserver import BaseServer, ThreadingTCPServer, StreamRequestHandler
 from socket import socket, AF_INET, SOCK_STREAM, SHUT_RDWR
+
+
+class TunnelQueue:
+    """Thread-safe queue of available ESP32 tunnel sockets."""
+    def __init__(self):
+        self._q = queue.Queue()
+
+    def put(self, sock):
+        self._q.put(sock)
+
+    def get(self, timeout=30):
+        return self._q.get(timeout=timeout)
 
 def byte_to_int(b):
     """
@@ -326,9 +339,9 @@ class Socks5Server(ThreadingTCPServer):
     SOCKS5 proxy server
     """
 
-    def __init__(self, port, auth=False, user_manager=None, allowed=None):
+    def __init__(self, port, auth=False, user_manager=None, allowed=None, tunnel_queue=None):
         ThreadingTCPServer.__init__(self, ('', port), Socks5RequestHandler)
-        self.__proxy_queue = queue.Queue()
+        self.__tunnel_queue = tunnel_queue if tunnel_queue is not None else TunnelQueue()
         self.__port = port
         self.__users = {}
         self.__auth = auth
@@ -356,13 +369,174 @@ class Socks5Server(ThreadingTCPServer):
         return self.__port
 
     def acquire_proxy_socket(self, timeout=30):
-        return self.__proxy_queue.get(timeout=timeout)
+        return self.__tunnel_queue.get(timeout=timeout)
 
     def set_proxy_socket(self, proxy_socket):
-        self.__proxy_queue.put(proxy_socket)
+        self.__tunnel_queue.put(proxy_socket)
 
     def get_user_manager(self):
         return self.__user_manager
 
     def set_user_manager(self, user_manager):
         self.__user_manager = user_manager
+
+
+# ---------------------------------------------------------------------------
+# HTTP proxy (CONNECT for HTTPS, plain HTTP GET/POST/etc)
+# Shares the same ESP socket queue as Socks5Server.
+# ---------------------------------------------------------------------------
+
+_HOP_BY_HOP = frozenset([
+    b'proxy-connection', b'proxy-authorization', b'keep-alive',
+    b'connection', b'transfer-encoding', b'te', b'trailers', b'upgrade',
+])
+
+
+def _recv_headers(sock):
+    """Read bytes until \r\n\r\n without over-reading. Returns (header_block, leftover)."""
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return None, None
+        buf += chunk
+    idx = buf.index(b'\r\n\r\n')
+    return buf[:idx], buf[idx + 4:]
+
+
+class HttpProxyRequestHandler(StreamRequestHandler):
+    def handle(self):
+        client = self.connection
+        try:
+            header_block, leftover = _recv_headers(client)
+            if header_block is None:
+                return
+
+            lines = header_block.split(b'\r\n')
+            request_line = lines[0].decode('latin-1')
+            parts = request_line.split(' ', 2)
+            if len(parts) != 3:
+                client.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                return
+            method, target, http_version = parts
+
+            if method.upper() == 'CONNECT':
+                # HTTPS tunnel: target is host:port
+                if ':' not in target:
+                    client.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                    return
+                host, port_str = target.rsplit(':', 1)
+                port = int(port_str)
+
+                try:
+                    proxy_socket = self.server.acquire_proxy_socket()
+                except queue.Empty:
+                    client.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+                    return
+
+                proxy_socket.sendall(('%s:%d' % (host, port)).encode())
+                client.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+
+                # leftover after headers is the first TLS ClientHello
+                if leftover:
+                    proxy_socket.sendall(leftover)
+
+                pipe = SocketPipe(client, proxy_socket)
+                pipe.start()
+                while pipe.is_running():
+                    time.sleep(0.05)
+
+            else:
+                # Plain HTTP: target is a full URL, e.g. http://example.com:80/path
+                m = re.match(r'https?://([^/:]+)(?::(\d+))?(.*)', target)
+                if not m:
+                    client.sendall(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                    return
+                host = m.group(1)
+                port = int(m.group(2)) if m.group(2) else 80
+                path = m.group(3) or '/'
+
+                try:
+                    proxy_socket = self.server.acquire_proxy_socket()
+                except queue.Empty:
+                    client.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n')
+                    return
+
+                proxy_socket.sendall(('%s:%d' % (host, port)).encode())
+
+                # Rebuild request: rewrite URL to path, strip hop-by-hop headers,
+                # downgrade to HTTP/1.0 to avoid keep-alive complications.
+                rebuilt = ('%s %s HTTP/1.0\r\n' % (method, path)).encode()
+                for line in lines[1:]:
+                    if not line:
+                        continue
+                    name = line.split(b':', 1)[0].strip().lower()
+                    if name not in _HOP_BY_HOP:
+                        rebuilt += line + b'\r\n'
+                rebuilt += b'Connection: close\r\n\r\n'
+
+                proxy_socket.sendall(rebuilt)
+                if leftover:
+                    proxy_socket.sendall(leftover)
+
+                pipe = SocketPipe(client, proxy_socket)
+                pipe.start()
+                while pipe.is_running():
+                    time.sleep(0.05)
+
+        except (OSError, ValueError):
+            try:
+                client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            except OSError:
+                pass
+
+
+class HttpProxyServer(ThreadingTCPServer):
+    """HTTP proxy server that tunnels through the shared ESP32 socket queue."""
+    allow_reuse_address = True
+
+    def __init__(self, port, tunnel_queue):
+        ThreadingTCPServer.__init__(self, ('', port), HttpProxyRequestHandler)
+        self.__port = port
+        self.__tunnel_queue = tunnel_queue
+
+    def acquire_proxy_socket(self, timeout=30):
+        return self.__tunnel_queue.get(timeout=timeout)
+
+    def start_background(self):
+        t = threading.Thread(target=self.serve_forever, daemon=True)
+        t.start()
+        print('HTTP proxy listening on 0.0.0.0:%d' % self.__port)
+
+
+class TcpForwardRequestHandler(StreamRequestHandler):
+    def handle(self):
+        client = self.connection
+        try:
+            proxy_socket = self.server.acquire_proxy_socket()
+        except queue.Empty:
+            client.close()
+            return
+        try:
+            proxy_socket.sendall(('%s:%d' % (self.server.target_host, self.server.target_port)).encode())
+            pipe = SocketPipe(client, proxy_socket)
+            pipe.start()
+            while pipe.is_running():
+                time.sleep(0.05)
+        except OSError:
+            pass
+
+
+class TcpForwardServer(ThreadingTCPServer):
+    """Static TCP port forwarder through the ESP32 tunnel."""
+    allow_reuse_address = True
+
+    def __init__(self, port, target_host, target_port, tunnel_queue):
+        ThreadingTCPServer.__init__(self, ('', port), TcpForwardRequestHandler)
+        self.target_host = target_host
+        self.target_port = target_port
+        self.__tunnel_queue = tunnel_queue
+        print('TCP forward  0.0.0.0:%d → %s:%d' % (port, target_host, target_port))
+
+    def acquire_proxy_socket(self, timeout=30):
+        return self.__tunnel_queue.get(timeout=timeout)

@@ -1,162 +1,93 @@
 import argparse
 import socket
 from threading import Thread
-import select
-import re
+
 import socks5
 
 
-socks5_server = None
-sockets = []
-fwds = []
-buffer_size = 4096
-
 def parse_args():
-  parser = argparse.ArgumentParser()
-  parser.add_argument("-r", "--remote", help="remote port")
-  parser.add_argument("-l", "--local", help="local port")
-  parser.add_argument("-t", "--target", help="host to connect CAUTION, port is mandatory (ie 192.168.1.1:80)")
-  parser.add_argument("-p", "--proxy", action='store_true', help="proxy mode")
-  parser.add_argument("-s", "--socks5", action='store_true', help="socks5 proxy mode")
-  return parser.parse_args()
-  
+    parser = argparse.ArgumentParser(
+        description='ESP32-S3 Reverse Tunnel Relay Server',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes (can be combined except -t with -s):
+  SOCKS5 proxy    -s
+  HTTP proxy      -H PORT
+  TCP forward     -t HOST:PORT  (listens on -l PORT)
 
-class TcpForwarder(Thread):
-  def __init__(self, sock1, sock2, host = '', port = ''):
-    Thread.__init__(self)
-    self.sock1 = sock1
-    self.sock2 = sock2
-    self.target_host = host
-    self.target_port = port
-    self.initial_data = b''
-    
-  def tunnelling(self, host, port, initial_data=b''):
-    self.target_host = host
-    self.target_port = port
-    self.initial_data = initial_data if isinstance(initial_data, bytes) else initial_data.encode()
-    
-  def run(self):
-    print("forwarding to %s:%s" % (self.target_host, self.target_port))
-    self.sock1.send(('%s:%s' % (self.target_host, self.target_port)).encode())
-    if self.initial_data:
-      self.sock1.send(self.initial_data)
-    while True:
-      inputready, outputready, exceptready = select.select([self.sock1, self.sock2], [], [])
-      for sock in inputready:
-        if sock == self.sock1:
-          data = self.sock1.recv(buffer_size)
-          if len(data) == 0:
-            print("Closing")
-            self.sock2.close()
-            self.sock1.close()
-            return
-          self.sock2.send(data)
+Examples:
+  %(prog)s -s -H 8080                     SOCKS5 on 6669 + HTTP proxy on 8080
+  %(prog)s -H 8080                         HTTP proxy only
+  %(prog)s -t 192.168.1.10:22 -l 2222     Forward local :2222 -> home SSH
+        """,
+    )
+    parser.add_argument(
+        '-r', '--remote', default='6668', metavar='PORT',
+        help='port the ESP32 connects to (default: 6668)',
+    )
+    parser.add_argument(
+        '-l', '--local', default='6669', metavar='PORT',
+        help='SOCKS5 or TCP-forward listening port (default: 6669)',
+    )
+    parser.add_argument(
+        '-s', '--socks5', action='store_true',
+        help='enable SOCKS5 proxy on -l port',
+    )
+    parser.add_argument(
+        '-H', '--http', metavar='PORT',
+        help='enable HTTP proxy on this port',
+    )
+    parser.add_argument(
+        '-t', '--target', metavar='HOST:PORT',
+        help='static TCP forward — all connections to -l port are tunnelled to HOST:PORT',
+    )
+    return parser.parse_args()
 
-        if sock == self.sock2:
-          data = self.sock2.recv(buffer_size)
-          if len(data) == 0:
-            print("Closing")
-            self.sock2.close()
-            self.sock1.close()
-            return
-          self.sock1.send(data)
-  
-class HttpForwarder(TcpForwarder):
-  def __init__(self, sock1, sock2):
-    TcpForwarder.__init__(self, sock1, sock2)
-    host, port, data = self.parse_request(sock2.recv(buffer_size))
-    self.tunnelling(host, port, data)
-  
-  def parse_request(self, _data):
-    host = None
-    port = None
-    data = ''
-    res = re.match('(GET) http:\/\/([^:\/]+):?(\d*)?(.*)\sHTTP', _data)
-    if res is not None:
-      action, host, port, uri = res.groups()
-      if port == '':
-        port = 80
-      data += "%s %s HTTP/1.0\n"%(action,uri)
-      # parse headers
-      lines = _data.split("\r\n")
-      for line in lines[1:]:
-        res = re.match('.*Keep-Alive', line)
-        if res is None:
-          data += "%s\r\n"%line
-    return (host, port, data)
 
-class TcpServer(Thread):
-  allow_reuse_address = True
-  def __init__(self, args, address):
-    Thread.__init__(self)
-    self.args = args
-    self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    print("Listening on %s:%s" % address)
-    self.server.bind(address)
-    self.server.listen(200)
+class EspListener(Thread):
+    """Accepts inbound ESP32 connections and feeds them into the tunnel queue."""
+    daemon = True
 
-class Server(TcpServer):
-  def run(self):
-    while True:
-      conn, addr = self.server.accept()
-      print('Connected by', addr)
-      if socks5_server is not None:
-        socks5_server.set_proxy_socket(conn)
-      else:
-        sockets.append(conn)
-        
+    def __init__(self, port, tunnel_queue):
+        Thread.__init__(self)
+        self._queue = tunnel_queue
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(('0.0.0.0', port))
+        self._server.listen(200)
+        print('ESP listener    0.0.0.0:%d' % port)
 
-class Proxy(TcpServer):
-  def run(self):
-    while True:
-      conn, addr = self.server.accept()
-      print('Connected by', addr)
-      if len(sockets) % 2 == 0:
-        conn.close()
-        print('refused')
-      else:
-        sockets.append(conn)
-        if len(sockets) % 2 == 0:
-          if self.args.proxy:
-            f = HttpForwarder(sockets[-2], sockets[-1])
-          else:
-            host, port = self.args.target.split(':')
-            f = TcpForwarder(sockets[-2], sockets[-1], host, port)
-          f.start()
-          fwds.append(f)
+    def run(self):
+        while True:
+            conn, addr = self._server.accept()
+            print('ESP connected from %s:%d' % addr)
+            self._queue.put(conn)
+
 
 def main(args):
-  global socks5_server
-  # Create the server, binding to localhost on port 9999
-  server = Server(args, ('0.0.0.0', args.remote))
-  server.start()
-  
-  if args.socks5:
-    print("starting socks5 server on %s" % args.local)
-    socks5.Socks5Server.allow_reuse_address = True
-    auth = False
-    allowed_ips = None
-    user_manager = socks5.UserManager()
-    socks5_server = socks5.Socks5Server(args.local, auth, user_manager, allowed=allowed_ips)
-    socks5_server.serve_forever()
-  else:
-    proxy = Proxy(args, ('0.0.0.0', args.local))
-    proxy.start()
-    proxy.join()
-  
-  server.join()
+    remote_port = int(args.remote)
+    local_port  = int(args.local)
 
-if __name__ == "__main__":
-  args = parse_args()
-  if args.remote is not None:
-    args.remote = int(args.remote)
-  else:
-    args.remote = 6668
+    tq = socks5.TunnelQueue()
 
-  if args.local is not None:
-    args.local = int(args.local)
-  else:
-    args.local = 6669
-    
-  main(args)
+    EspListener(remote_port, tq).start()
+
+    if args.target:
+        # Static TCP forward mode
+        host, port_str = args.target.rsplit(':', 1)
+        srv = socks5.TcpForwardServer(local_port, host, int(port_str), tq)
+        if args.http:
+            socks5.HttpProxyServer(int(args.http), tq).start_background()
+        srv.serve_forever()
+    else:
+        # Proxy mode: SOCKS5 always starts, HTTP proxy is optional.
+        socks5.Socks5Server.allow_reuse_address = True
+        srv = socks5.Socks5Server(local_port, tunnel_queue=tq)
+        print('SOCKS5 proxy    0.0.0.0:%d' % local_port)
+        if args.http:
+            socks5.HttpProxyServer(int(args.http), tq).start_background()
+        srv.serve_forever()
+
+
+if __name__ == '__main__':
+    main(parse_args())
